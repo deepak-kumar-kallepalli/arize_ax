@@ -10,16 +10,19 @@ Usage:
 
 import argparse
 import time
+from datetime import datetime, timedelta, timezone
 
 from config import get_client
 from evaluators import (
     add_llm_judge_version,
     create_custom_code_evaluator,
     create_llm_judge_evaluator,
+    find_evaluator,
     list_versions,
 )
 from experiments import create_golden_dataset, run_experiment
 from tasks import create_dataset_task, create_project_task, run_task_now
+from spans import list_spans
 
 HALLUCINATION_TEMPLATE_V1 = """\
 You are an evaluation assistant. Given the input and output below, decide
@@ -69,45 +72,54 @@ def main() -> None:
 
     client = get_client()
 
-    
+    # 1. LLM-as-judge evaluator (scope=span, maximize, explanations on).
+    # Get-or-create: names are unique per space, and a first run may have
+    # created it already.
+    e_time = datetime.now(timezone.utc)
+    s_time = e_time - timedelta(days=20)
 
-    # 1. LLM-as-judge evaluator (scope=span, maximize, explanations on)
-    judge = create_llm_judge_evaluator(
-        client,
-        name="hallucination-judge",
-        description="Detects hallucinated content in LLM responses",
-        template=HALLUCINATION_TEMPLATE_V1,
-        choices={"factual": 1, "hallucinated": 0},
-        scope="span",
-        optimization_direction="maximize",
-        enable_explanations=True,
-        enable_structured_output=False,
-        enable_function_calling=True,
-    )
-    print(f"Created LLM judge evaluator: {judge.id} (version {judge.version.id})")
+    judge = find_evaluator(client, name="hallucination-judge")
+    list_spans(client, "arize-final-test", start_time=s_time, end_time=e_time)
+
+    # if judge:
+    #     print(f"Reusing LLM judge evaluator: {judge.id}")
+    # else:
+    #     judge = create_llm_judge_evaluator(
+    #         client,
+    #         name="hallucination-judge",
+    #         description="Detects hallucinated content in LLM responses",
+    #         template=HALLUCINATION_TEMPLATE_V1,
+    #         choices={"factual": 1, "hallucinated": 0},
+    #         scope="span",
+    #         optimization_direction="maximize",
+    #         enable_explanations=True,
+    #         enable_structured_output=False,
+    #         enable_function_calling=True,
+    #     )
+    #     print(f"Created LLM judge evaluator: {judge.id} (version {judge.version.id})")
 
     # 2. Custom code evaluator
-    code_eval = create_custom_code_evaluator(
-        client,
-        name="response-length-check",
-        description="Fails empty or overly long responses",
-        code=RESPONSE_LENGTH_CODE,
-        variables=["output"],
-        scope="span",
-    )
-    print(f"Created code evaluator: {code_eval.id} (version {code_eval.version.id})")
+    # code_eval = create_custom_code_evaluator(
+    #     client,
+    #     name="response-length-check",
+    #     description="Fails empty or overly long responses",
+    #     code=RESPONSE_LENGTH_CODE,
+    #     variables=["output"],
+    #     scope="span",
+    # )
+    # print(f"Created code evaluator: {code_eval.id} (version {code_eval.version.id})")
 
     # 3. Add a v2 to the judge evaluator
-    v2 = add_llm_judge_version(
-        client,
-        evaluator=judge.id,
-        eval_name="hallucination-judge",
-        commit_message="Stricter grounding criteria",
-        template=HALLUCINATION_TEMPLATE_V2,
-        choices={"factual": 1, "hallucinated": 0},
-    )
-    versions = list_versions(client, evaluator=judge.id)
-    print(f"Added version {v2.id}; evaluator now has {len(versions)} versions")
+    # v2 = add_llm_judge_version(
+    #     client,
+    #     evaluator=judge.id,
+    #     eval_name="hallucination-judge",
+    #     commit_message="Stricter grounding criteria",
+    #     template=HALLUCINATION_TEMPLATE_V2,
+    #     choices={"factual": 1, "hallucinated": 0},
+    # )
+    # versions = list_versions(client, evaluator=judge.id)
+    # print(f"Added version {v2.id}; evaluator now has {len(versions)} versions")
 
     # 4a. Continuous task on a project with span filter + variable mapping
     if args.project:
@@ -125,11 +137,22 @@ def main() -> None:
                 }
             ],
             project=args.project,
-            query_filter="attributes.openinference.span.kind == 'LLM'",
+            query_filter="attributes.openinference.span.kind = 'AGENT'",
             sampling_rate=1.0,
-            is_continuous=True,
+            is_continuous=False,
         )
         print(f"Created continuous project task: {task.id}")
+
+        end_time = datetime.now(timezone.utc)
+
+        run = run_task_now(
+            client,
+            task=task.id,
+            data_start_time=end_time - timedelta(days=10),
+            data_end_time=end_time,
+        )
+        print(f"Run {run.id} finished with status: {run.status}")
+
 
     # 4b. On-demand task on a dataset (golden dataset -> experiment -> eval)
     if args.create_golden:

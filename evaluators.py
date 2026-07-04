@@ -5,7 +5,7 @@ Mirrors the UI "New Evaluator" form:
   optimization_direction, enable explanations,
   enable_structured_output, enable_function_calling.
 """
-
+import arize_compat  # noqa: F401  (tolerate newer API response fields)
 from arize import ArizeClient
 from arize._generated.api_client.models.invocation_params import InvocationParams
 from arize._generated.api_client.models.provider_params import ProviderParams
@@ -199,6 +199,20 @@ def add_code_version(
         commit_message=commit_message,
         code_config=code_config,
     )
+
+
+def find_evaluator(
+    client: ArizeClient, *, name: str
+) -> EvaluatorWithVersion | None:
+    """Return the evaluator with this exact name (with its current
+    version), or None. Lets callers get-or-create instead of failing on
+    the unique-name constraint."""
+
+    resp = client.evaluators.list(space=SPACE_ID, name=name)
+    for ev in resp.evaluators:  # list() matches substrings
+        if ev.name == name:
+            return client.evaluators.get(space=SPACE_ID, evaluator=ev.id)
+    return None
 
 
 def list_versions(client: ArizeClient, *, evaluator: str):
