@@ -1,0 +1,194 @@
+PLAN: Arize AX — Evaluators (LLM-as-judge + code) and Tasks via the Python SDK
+================================================================================
+
+GOAL
+----
+Programmatically reproduce what the Arize AX UI does when you create an
+Evaluator and a Task: create LLM-as-judge (template) and code evaluators,
+version them, and run them against a Project (spans) or a Dataset —
+including span filters and variable/column mapping.
+
+SDK CHOICE
+----------
+Use the latest stable unified SDK:  pip install "arize>=8"
+(The v8+ "ArizeClient" SDK is the current stable line and has first-class
+Evaluators and Tasks APIs — no GraphQL needed. The older GraphQL
+createEvalTask mutation still exists but the SDK is the supported path.)
+
+Auth: ARIZE_API_KEY env var (Space settings -> API key), plus your
+SPACE_ID. LLM-as-judge evaluators also need an AI integration
+(ai_integration_id) already configured in the space (Settings -> AI
+integrations) — that's what the UI uses under the hood for the judge model.
+
+CLIENT SETUP
+------------
+    from arize import ArizeClient
+    client = ArizeClient()          # reads ARIZE_API_KEY from env
+
+Subclients used: client.evaluators, client.tasks
+(datasets/projects subclients only for looking up IDs by name)
+
+UI SCHEMA -> API FIELD MAPPING
+------------------------------
+Evaluator (UI)                     API (evaluators create / version payload)
+  name                          -> name  (unique per space)
+  scope: span|trace|session     -> version.template_config.data_granularity
+  template                      -> version.template_config.template
+                                   ({variable} placeholders)
+  choices                       -> version.template_config.classification_choices
+                                   e.g. {"correct": 1, "incorrect": 0}
+  optimization_direction        -> version.template_config.direction
+                                   ("maximize" | "minimize")
+  enable explanations           -> version.template_config.include_explanations
+  enable_function_calling       -> version.template_config.use_function_calling_if_available
+  enable_structured_output      -> structured-output flag on template_config
+                                   (verify exact field name on the installed
+                                   version's EvaluatorTemplateConfig model —
+                                   it is a sibling of the function-calling flag)
+  judge model                   -> version.template_config.llm_config:
+                                   {ai_integration_id, model_name,
+                                    invocation_parameters: {temperature: 0}}
+  version                       -> version.commit_message (every create /
+                                   update is an immutable version)
+
+Task / evaluator configuration (UI)   API (tasks.create_evaluation_task)
+  datasource = project          -> project="<project-id-or-name>"
+  datasource = dataset          -> dataset="<dataset-id-or-name>"
+  filter spans                  -> query_filter="attributes.openinference.span.kind == 'LLM'"
+  variable mapping              -> evaluators[i].column_mappings, e.g.
+                                   {"input": "attributes.input.value",
+                                    "output": "attributes.output.value"}
+  run mode                      -> is_continuous=True (online) or False
+                                   (one-shot/on-demand), sampling_rate=0.0-1.0
+
+FUNCTIONS I INTEND TO USE (from the arize library)
+--------------------------------------------------
+1. ArizeClient()                              — arize.ArizeClient
+2. client.evaluators.create(                  — create evaluator + initial version
+       space_id=..., name=..., description=...,
+       type="template" | "code",
+       version={commit_message, template_config | code_config})
+   - template_config: fields per mapping table above (LLM-as-judge)
+   - code_config: {"type": "custom", "code": "<python>", "imports": [...],
+                   "variables": [...]}    # or type="managed" + managed_evaluator
+3. client.evaluators.create_version(          — add a NEW VERSION to an existing
+       evaluator_id=..., commit_message=...,    evaluator (REST: POST
+       template_config=... / code_config=...)   /v2/evaluators/{id}/versions)
+4. client.evaluators.list(...) / .get(...)    — look up evaluators & versions
+5. client.tasks.create_evaluation_task(       — run evaluators on a datasource
+       name=..., task_type="template_evaluation" | "code_evaluation",
+       evaluators=[BaseEvaluationTaskRequestEvaluatorsInner(
+           evaluator_id=..., column_mappings={...})],
+       project=... OR dataset=..., space=...,
+       query_filter=..., sampling_rate=..., is_continuous=...)
+   (type import: arize.tasks.types.BaseEvaluationTaskRequestEvaluatorsInner)
+6. client.tasks.list(...) / .get(...)         — verify task status/results
+
+IMPLEMENTATION STEPS (minimal — 3 small files)
+----------------------------------------------
+1. setup
+   - pip install "arize>=8"; put ARIZE_API_KEY, ARIZE_SPACE_ID,
+     AI_INTEGRATION_ID in .env
+   - smoke-test: instantiate ArizeClient, list projects/datasets
+
+2. evaluators.py
+   - create_llm_judge_evaluator(name, scope, template, choices,
+       direction, explanations, structured_output, function_calling)
+       -> client.evaluators.create(type="template", ...)
+   - create_code_evaluator(name, code, imports, variables)
+       -> client.evaluators.create(type="code", ...)
+   - add_evaluator_version(evaluator_id, commit_message, new_config)
+       -> client.evaluators.create_version(...)
+
+3. tasks.py
+   - run_on_project(task_name, evaluator_id, project, query_filter,
+       column_mappings, sampling_rate, continuous)
+   - run_on_dataset(task_name, evaluator_id, dataset, column_mappings)
+   both -> client.tasks.create_evaluation_task(...)
+
+4. main.py (demo)
+   - create one LLM-as-judge evaluator (e.g. hallucination, span scope,
+     choices {"factual":1,"hallucinated":0}, maximize, explanations on)
+   - create one code evaluator (e.g. custom regex/length check)
+   - add a v2 to the judge evaluator (changed template wording)
+   - launch: one continuous task on a project with a span filter +
+     variable mapping; one on-demand task on a dataset
+   - print created IDs and verify via client.tasks.get / Arize UI
+
+VERIFICATION
+------------
+- Evaluator + both versions visible under Evaluators in the AX UI
+- Task appears under Tasks with the right datasource, filter, and mapping
+- Eval labels/scores/explanations show up on spans (project) or
+  dataset rows after the task runs
+
+NOTES / RISKS
+-------------
+- Evaluator names must be unique within the space; creating with an
+  existing name fails — use create_version to iterate instead.
+- The exact structured-output flag name and the evaluators subclient
+  method names (create/create_version/list) should be confirmed against
+  the installed SDK (dir(client.evaluators)) — the REST endpoints
+  (POST /v2/evaluators, POST /v2/evaluators/{id}/versions) are stable,
+  and the generated EvaluatorsApi is the fallback if a convenience
+  method is missing.
+- Scope=trace/session (data_granularity) requires the project to have
+  trace/session-level data; span is the safe default.
+
+
+================================================================================
+PART 2: CUSTOM METRICS (latency p55/p99, averages, space/user ratios)
+================================================================================
+
+APPROACH
+--------
+Evaluators/tasks grade individual rows; aggregate metrics (percentiles,
+averages, ratios) are a different job. Two complementary paths:
+
+A. SDK path (programmatic, recommended here): export raw spans to a
+   pandas DataFrame and compute anything — full flexibility, runs
+   anywhere (cron, CI, notebook).
+B. Platform path (optional later): define ArizeQL custom metrics in the
+   Arize UI/GraphQL so p99 latency etc. live natively in dashboards and
+   monitors with alerting. Use when you want Arize to own the chart.
+
+FUNCTIONS FROM THE ARIZE LIBRARY
+--------------------------------
+1. client.spans.export_to_df(space_id, project_name, start_time,
+       end_time, where=..., columns=...)     -> spans as pandas DataFrame
+   (export_to_parquet for large windows)
+2. client.spaces.list(organization_id=...)   -> all spaces
+3. client.users.list()                       -> users (org-scoped listing)
+4. client.spaces.get / role_bindings.*       -> per-space membership
+   (verify at implementation which carries membership counts; the
+   API key must have org-level visibility for cross-space totals)
+
+IMPLEMENTATION (one new file: metrics.py)
+-----------------------------------------
+- export_spans_df(client, project, hours=24, where="")
+    thin wrapper over client.spans.export_to_df; where can restrict to
+    root spans / LLM spans for request-level latency
+- latency_stats(df, percentiles=(0.55, 0.99))
+    latency_ms = (end_time - start_time).dt.total_seconds()*1000
+    returns {p55, p99, mean, count} via df.quantile / df.mean
+- column_averages(df, columns)
+    averages for any numeric span attribute (token counts, cost, ...)
+- space_user_ratio(client)
+    users in current space (ARIZE_SPACE_ID) / total distinct users
+    across all spaces in the org
+- CLI: python metrics.py --project <name> --hours 24
+    prints a small report (latency percentiles, averages, user ratio)
+
+VERIFICATION
+------------
+- Offline: signature checks + latency/average math against a synthetic
+  DataFrame with known quantiles
+- Live: run against a real project window and sanity-check numbers vs
+  the Arize UI latency chart
+
+NOTES
+-----
+- p55/p99 need the raw distribution — that's why we export spans rather
+  than asking the API for pre-aggregated numbers.
+- Cross-space user totals may require an org/account-scoped API key;
+  a space-scoped key may only see its own space.
